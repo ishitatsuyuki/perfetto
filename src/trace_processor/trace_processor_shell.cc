@@ -132,6 +132,7 @@ struct CommandLineOptions {
   bool dev = false;
   std::vector<std::string> dev_flags;
   bool extra_checks = false;
+  bool experimental_duckdb = false;
   std::string export_file_path;
   std::string perf_file_path;
   bool wide = false;
@@ -240,6 +241,9 @@ PerfettoSQL:
  --add-sql-package PATH[@PACKAGE]     Registers SQL files from a directory as
                                       a package for use with INCLUDE PERFETTO
                                       MODULE statements.
+ --experimental-duckdb                Runs plain SQL queries on the DuckDB PoC
+                                      backend instead of SQLite. Requires a
+                                      DuckDB-enabled build.
 
                                       By default, the directory name becomes the
                                       root package name. Use @PACKAGE to
@@ -427,6 +431,7 @@ enum LongOption {
   OPT_DEV,
   OPT_DEV_FLAG,
   OPT_EXTRA_CHECKS,
+  OPT_EXPERIMENTAL_DUCKDB,
   OPT_ANALYZE_TRACE_PROTO_CONTENT,
   OPT_CROP_TRACK_EVENTS,
   OPT_REGISTER_FILES_DIR,
@@ -480,6 +485,7 @@ const option kLongOptions[] = {
     {"dev", no_argument, nullptr, OPT_DEV},
     {"dev-flag", required_argument, nullptr, OPT_DEV_FLAG},
     {"extra-checks", no_argument, nullptr, OPT_EXTRA_CHECKS},
+    {"experimental-duckdb", no_argument, nullptr, OPT_EXPERIMENTAL_DUCKDB},
     {"export", required_argument, nullptr, 'e'},
     {"perf-file", required_argument, nullptr, 'p'},
     {"wide", no_argument, nullptr, 'W'},
@@ -617,6 +623,11 @@ CommandLineOptions ParseCommandLineOptions(int argc, char** argv) {
 
     if (option == OPT_EXTRA_CHECKS) {
       command_line_options.extra_checks = true;
+      continue;
+    }
+
+    if (option == OPT_EXPERIMENTAL_DUCKDB) {
+      command_line_options.experimental_duckdb = true;
       continue;
     }
 
@@ -963,6 +974,8 @@ base::Status TraceProcessorShell::Run(int argc, char** argv) {
     }
     if (options.extra_checks)
       args.emplace_back("--extra-checks");
+    if (options.experimental_duckdb)
+      args.emplace_back("--experimental-duckdb");
     for (const auto& p : options.sql_package_paths) {
       args.emplace_back("--add-sql-package");
       args.emplace_back(p);

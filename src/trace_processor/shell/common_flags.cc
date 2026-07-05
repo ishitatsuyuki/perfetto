@@ -123,6 +123,9 @@ std::vector<FlagSpec> GetGlobalFlagSpecs(GlobalOptions* opts) {
   flags.push_back(BoolFlag("extra-checks", '\0',
                            "Enables additional SQL error checks.",
                            &opts->extra_checks));
+  flags.push_back(BoolFlag("experimental-duckdb", '\0',
+                           "Run plain SQL queries on DuckDB (PoC).",
+                           &opts->experimental_duckdb));
   flags.push_back(
       {/*long_name=*/"add-sql-package", /*short_name=*/'\0',
        /*has_arg=*/true, /*arg_name=*/"PATH[@PKG]",
@@ -313,6 +316,15 @@ Config BuildConfig(const GlobalOptions& opts,
 
   if (opts.extra_checks) {
     config.enable_extra_checks = true;
+  }
+  if (opts.experimental_duckdb) {
+#if PERFETTO_BUILDFLAG(PERFETTO_TP_DUCKDB)
+    config.experimental_duckdb = true;
+#else
+    PERFETTO_FATAL(
+        "--experimental-duckdb requires "
+        "enable_perfetto_trace_processor_duckdb=true");
+#endif
   }
 
   return config;

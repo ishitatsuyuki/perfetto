@@ -78,6 +78,10 @@
 #include "src/trace_processor/importers/proto/track_event_module.h"
 #include "src/trace_processor/importers/simpleperf_proto/simpleperf_proto_tokenizer.h"
 #include "src/trace_processor/importers/systrace/systrace_trace_parser.h"
+#if PERFETTO_BUILDFLAG(PERFETTO_TP_DUCKDB)
+#include "src/trace_processor/duckdb/duckdb_engine.h"
+#endif
+#include "src/trace_processor/iterator_impl.h"
 #include "src/trace_processor/metrics/all_chrome_metrics.descriptor.h"
 #include "src/trace_processor/metrics/all_webview_metrics.descriptor.h"
 #include "src/trace_processor/metrics/metrics.descriptor.h"
@@ -309,10 +313,88 @@ std::pair<int64_t, int64_t> AggregatePluginTimestampBounds(
   return {start_ns, end_ns};
 }
 
+#if PERFETTO_BUILDFLAG(PERFETTO_TP_DUCKDB)
+class DuckDbIteratorImpl final : public IteratorImpl {
+ public:
+  DuckDbIteratorImpl(TraceProcessorImpl* trace_processor,
+                     base::StatusOr<DuckDbEngine::QueryResult> result,
+                     uint32_t sql_stats_row)
+      : trace_processor_(trace_processor),
+        result_(std::move(result)),
+        sql_stats_row_(sql_stats_row) {}
+
+  ~DuckDbIteratorImpl() override {
+    if (trace_processor_) {
+      base::TimeNanos t_end = base::GetWallTimeNs();
+      auto* sql_stats =
+          trace_processor_->context()->storage->mutable_sql_stats();
+      sql_stats->RecordQueryEnd(sql_stats_row_, t_end.count());
+    }
+  }
+
+  bool Next() override {
+    if (!called_next_) {
+      RecordFirstNextInSqlStats();
+      called_next_ = true;
+    }
+    return result_.ok() && result_->Step();
+  }
+
+  SqlValue Get(uint32_t col) const override {
+    PERFETTO_DCHECK(result_.ok());
+    return result_->Get(col);
+  }
+
+  std::string GetColumnName(uint32_t col) const override {
+    return result_.ok() ? result_->GetColumnName(col) : "";
+  }
+
+  base::Status Status() const override {
+    return result_.ok() ? result_->status : result_.status();
+  }
+
+  uint32_t ColumnCount() const override {
+    return result_.ok() ? result_->ColumnCount() : 0;
+  }
+
+  uint32_t StatementCount() const override {
+    return result_.ok() ? result_->StatementCount() : 0;
+  }
+
+  uint32_t StatementCountWithOutput() const override {
+    return result_.ok() ? result_->StatementCountWithOutput() : 0;
+  }
+
+  std::string LastStatementSql() override {
+    return result_.ok() ? result_->sql : "";
+  }
+
+ private:
+  void RecordFirstNextInSqlStats() {
+    base::TimeNanos t_first_next = base::GetWallTimeNs();
+    auto* sql_stats = trace_processor_->context()->storage->mutable_sql_stats();
+    sql_stats->RecordQueryFirstNext(sql_stats_row_, t_first_next.count());
+  }
+
+  TraceProcessorImpl* trace_processor_ = nullptr;
+  base::StatusOr<DuckDbEngine::QueryResult> result_;
+  uint32_t sql_stats_row_ = 0;
+  bool called_next_ = false;
+};
+#endif
+
 }  // namespace
 
 TraceProcessorImpl::TraceProcessorImpl(const Config& cfg)
     : TraceProcessorStorageImpl(cfg), config_(cfg) {
+#if PERFETTO_BUILDFLAG(PERFETTO_TP_DUCKDB)
+  if (config_.experimental_duckdb) {
+    duckdb_engine_ = std::make_unique<DuckDbEngine>();
+  }
+#else
+  PERFETTO_CHECK(!config_.experimental_duckdb);
+#endif
+
   // TODO(lalitm): plugins should self-register via PERFETTO_TP_REGISTER_PLUGIN
   // (a global static initializer). That's currently disabled due to build-time
   // issues, so instead each plugin exposes an explicit Register* function that
@@ -652,6 +734,35 @@ Iterator TraceProcessorImpl::ExecuteQuery(const std::string& sql) {
       context()->storage->mutable_sql_stats()->RecordQueryBegin(
           sql, base::GetWallTimeNs().count());
   std::string non_breaking_sql = base::ReplaceAll(sql, "\u00A0", " ");
+#if PERFETTO_BUILDFLAG(PERFETTO_TP_DUCKDB)
+  if (config_.experimental_duckdb) {
+    CacheBoundsAndBuildTable();
+    std::vector<DuckDbEngine::StaticTable> tables;
+    tables.reserve(plugin_dataframes_.size());
+    for (auto& df : plugin_dataframes_) {
+      tables.push_back({df.dataframe, df.name});
+    }
+
+    base::Status import_status = duckdb_engine_->RegisterDataframes(tables);
+    if (import_status.ok()) {
+      import_status = duckdb_engine_->ImportSqliteTables(
+          engine_->sqlite_connection()->db(), {"stats", "sqlstats"},
+          cached_trace_bounds_);
+    }
+    if (import_status.ok()) {
+      import_status = duckdb_engine_->InstallPrelude();
+    }
+    std::vector<SqlPackage> sql_packages(registered_sql_packages_.begin(),
+                                         registered_sql_packages_.end());
+    base::StatusOr<DuckDbEngine::QueryResult> result =
+        import_status.ok()
+            ? duckdb_engine_->Execute(non_breaking_sql, sql_packages)
+            : base::StatusOr<DuckDbEngine::QueryResult>(
+                  std::move(import_status));
+    return Iterator(std::make_unique<DuckDbIteratorImpl>(
+        this, std::move(result), sql_stats_row));
+  }
+#endif
   base::StatusOr<PerfettoSqlConnection::ExecutionResult> result =
       engine_->ExecuteUntilLastStatement(
           SqlSource::FromExecuteQuery(std::move(non_breaking_sql)));
@@ -814,6 +925,13 @@ base::Status TraceProcessorImpl::RegisterFileContent(const std::string& path,
 }
 
 void TraceProcessorImpl::InterruptQuery() {
+#if PERFETTO_BUILDFLAG(PERFETTO_TP_DUCKDB)
+  if (config_.experimental_duckdb) {
+    query_interrupted_.store(true);
+    duckdb_engine_->Interrupt();
+    return;
+  }
+#endif
   if (!engine_->sqlite_connection()->db())
     return;
   query_interrupted_.store(true);

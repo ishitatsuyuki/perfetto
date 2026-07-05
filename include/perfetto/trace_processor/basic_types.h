@@ -205,6 +205,12 @@ struct PERFETTO_EXPORT_COMPONENT Config {
   // to catch additional classes of SQL errors.
   bool enable_extra_checks = false;
 
+  // Experimental: execute queries using DuckDB instead of the SQLite-backed
+  // PerfettoSQL engine. This is a proof-of-concept backend with limited
+  // PerfettoSQL stdlib support and does not support metrics or SQLite virtual
+  // table operators.
+  bool experimental_duckdb = false;
+
   // A list of additional protobuf descriptors used to extend trace processor's
   // parsing capabilities at runtime, for instance to parse custom Android
   // statsd atoms.

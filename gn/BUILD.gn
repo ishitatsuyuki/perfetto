@@ -98,6 +98,7 @@ action("gen_buildflags") {
     "PERFETTO_TP_PERCENTILE=$enable_perfetto_trace_processor_percentile",
     "PERFETTO_TP_LINENOISE=$enable_perfetto_trace_processor_linenoise",
     "PERFETTO_TP_HTTPD=$enable_perfetto_trace_processor_httpd",
+    "PERFETTO_TP_DUCKDB=$enable_perfetto_trace_processor_duckdb",
     "PERFETTO_TP_INSTRUMENTS=$enable_perfetto_trace_processor_mac_instruments",
     "PERFETTO_LOCAL_SYMBOLIZER=$perfetto_local_symbolizer",
     "PERFETTO_ZLIB=$enable_perfetto_zlib",
@@ -387,6 +388,18 @@ if (enable_perfetto_trace_processor_sqlite) {
       public_configs = [ ":sqlite_third_party_include_path" ]
     }
   }
+}
+
+if (enable_perfetto_trace_processor_duckdb) {
+  group("duckdb") {
+    public_configs = [ ":duckdb_system_config" ]
+  }
+}
+
+config("duckdb_system_config") {
+  include_dirs = [ perfetto_duckdb_include_dir ]
+  lib_dirs = [ perfetto_duckdb_lib_dir ]
+  libs = [ "duckdb" ]
 }
 
 config("sqlite_third_party_include_path") {

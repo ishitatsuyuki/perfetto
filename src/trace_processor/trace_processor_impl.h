@@ -43,6 +43,10 @@
 #include "src/trace_processor/types/trace_processor_context.h"
 #include "src/trace_processor/util/descriptors.h"
 
+#if PERFETTO_BUILDFLAG(PERFETTO_TP_DUCKDB)
+#include "src/trace_processor/duckdb/duckdb_engine.h"
+#endif
+
 namespace perfetto::trace_processor {
 
 class SqliteIteratorImpl;
@@ -182,6 +186,9 @@ class TraceProcessorImpl : public TraceProcessor,
   std::vector<PluginDataframe> plugin_dataframes_;
 
   std::unique_ptr<PerfettoSqlConnection> engine_;
+#if PERFETTO_BUILDFLAG(PERFETTO_TP_DUCKDB)
+  std::unique_ptr<DuckDbEngine> duckdb_engine_;
+#endif
 
   DescriptorPool metrics_descriptor_pool_;
 

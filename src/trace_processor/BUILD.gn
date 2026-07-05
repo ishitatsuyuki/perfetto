@@ -286,6 +286,9 @@ if (enable_perfetto_trace_processor_sqlite) {
         "plugins/winscope_surfaceflinger_hierarchy_paths",
       ]
     }
+    if (enable_perfetto_trace_processor_duckdb) {
+      deps += [ "duckdb" ]
+    }
 
     public_deps = [
       "../../gn:sqlite",  # sqlite_iterator_impl.h includes sqlite3.h.

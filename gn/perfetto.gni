@@ -471,6 +471,13 @@ declare_args() {
   # from /usr/include instead of the hermetic one.
   perfetto_use_system_sqlite = false
 
+  # Experimental proof-of-concept backend for running simple trace processor
+  # queries on DuckDB instead of SQLite. This intentionally defaults to false
+  # and links against a system DuckDB installation.
+  enable_perfetto_trace_processor_duckdb = false
+  perfetto_duckdb_include_dir = "/usr/include"
+  perfetto_duckdb_lib_dir = "/usr/lib"
+
   perfetto_use_system_zlib = false
 
   # Set by the amalgamated SDK build. Defaults the optional zlib/re2 features
