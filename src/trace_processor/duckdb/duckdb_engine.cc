@@ -18,6 +18,8 @@
 
 #include <duckdb.h>
 #include <sqlite3.h>
+#include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
@@ -71,6 +73,10 @@ std::string ApplyDuckDbSqlRewrites(std::string sql) {
       // DuckDB has GLOB, but SQLite's `R*` pattern means DuckDB's `R%` LIKE.
       {" GLOB 'R*'", " LIKE 'R%'"},
       {" glob 'R*'", " LIKE 'R%'"},
+      // DuckDB requires selected expressions in aggregate queries to either be
+      // grouped or aggregated. This value is functionally tied to the GROUP BY
+      // key in sched.time_in_state.
+      {" / total_runtime AS other", " / max(total_runtime) AS other"},
   };
   for (const Rewrite& rewrite : kRewrites) {
     sql = base::ReplaceAll(sql, rewrite.from, rewrite.to);
@@ -123,6 +129,29 @@ const std::string* FindSqlModule(const std::vector<SqlPackage>& sql_packages,
     return nullptr;
   }
   return nullptr;
+}
+
+constexpr std::array<std::string_view, 6> kTokensAllowedInMacro{
+    "ColumnNameList", "_ProjectionFragment", "_TableNameList", "ColumnName",
+    "Expr",           "TableOrSubquery",
+};
+
+bool IsTokenAllowedInMacro(const std::string& str) {
+  base::StringView view = base::StringView{str};
+  return std::any_of(kTokensAllowedInMacro.begin(), kTokensAllowedInMacro.end(),
+                     [&view](const auto& allowed_token) {
+                       return view.CaseInsensitiveEq(base::StringView{
+                           allowed_token.data(), allowed_token.size()});
+                     });
+}
+
+std::string GetTokenNamesAllowedInMacro() {
+  std::vector<std::string> result;
+  result.reserve(kTokensAllowedInMacro.size());
+  for (auto token : kTokensAllowedInMacro) {
+    result.emplace_back(token);
+  }
+  return base::Join(result, ", ");
 }
 
 const char* DuckDbTypeForColumn(
@@ -694,6 +723,21 @@ base::Status DuckDbEngine::InstallPrelude() {
         FROM __intrinsic_process
       )",
       R"(
+        CREATE OR REPLACE MACRO trace_start() AS (
+          SELECT start_ts FROM trace_bounds
+        )
+      )",
+      R"(
+        CREATE OR REPLACE MACRO trace_end() AS (
+          SELECT end_ts FROM trace_bounds
+        )
+      )",
+      R"(
+        CREATE OR REPLACE MACRO trace_dur() AS (
+          SELECT end_ts - start_ts FROM trace_bounds
+        )
+      )",
+      R"(
         CREATE OR REPLACE VIEW args AS
         SELECT
           id,
@@ -1138,16 +1182,61 @@ DuckDbEngine::ExecuteReturningStatement(const std::string& sql) {
   return base::StatusOr<QueryResult>(std::move(result));
 }
 
+base::Status DuckDbEngine::ExecuteCreateMacro(
+    const PerfettoSqlParser::CreateMacro& create_macro) {
+  for (const auto& [name, type] : create_macro.args) {
+    if (!IsTokenAllowedInMacro(type.sql())) {
+      return base::ErrStatus(
+          "%sMacro '%s' argument '%s' is unknown type '%s'. Allowed types: "
+          "%s",
+          type.AsTraceback(0).c_str(), create_macro.name.sql().c_str(),
+          name.sql().c_str(), type.sql().c_str(),
+          GetTokenNamesAllowedInMacro().c_str());
+    }
+  }
+  if (!IsTokenAllowedInMacro(create_macro.returns.sql())) {
+    return base::ErrStatus(
+        "%sMacro %s return type %s is unknown. Allowed types: %s",
+        create_macro.returns.AsTraceback(0).c_str(),
+        create_macro.name.sql().c_str(), create_macro.returns.sql().c_str(),
+        GetTokenNamesAllowedInMacro().c_str());
+  }
+
+  std::vector<std::string> args;
+  args.reserve(create_macro.args.size());
+  for (const auto& arg : create_macro.args) {
+    args.push_back(arg.first.sql());
+  }
+  PerfettoSqlPreprocessor::Macro macro{
+      create_macro.replace,
+      create_macro.name.sql(),
+      std::move(args),
+      create_macro.sql,
+  };
+
+  if (auto* existing = macros_.Find(create_macro.name.sql()); existing) {
+    if (!create_macro.replace) {
+      return base::ErrStatus("%sMacro already exists",
+                             create_macro.name.AsTraceback(0).c_str());
+    }
+    *existing = std::move(macro);
+    return base::OkStatus();
+  }
+  std::string name = macro.name;
+  auto it_and_inserted = macros_.Insert(std::move(name), std::move(macro));
+  PERFETTO_CHECK(it_and_inserted.second);
+  return base::OkStatus();
+}
+
 base::StatusOr<DuckDbEngine::QueryResult> DuckDbEngine::Execute(
     const std::string& sql,
     const std::vector<SqlPackage>& sql_packages) {
-  base::FlatHashMap<std::string, PerfettoSqlPreprocessor::Macro> macros;
   QueryResult setup_result;
   std::optional<QueryResult> final_result;
 
   std::function<base::Status(SqlSource)> execute_source =
       [&](SqlSource source) -> base::Status {
-    PerfettoSqlParser parser(std::move(source), macros);
+    PerfettoSqlParser parser(std::move(source), macros_);
     while (parser.Next()) {
       const PerfettoSqlParser::Statement& stmt = parser.statement();
       std::optional<std::string> duckdb_sql;
@@ -1162,6 +1251,12 @@ base::StatusOr<DuckDbEngine::QueryResult> DuckDbEngine::Execute(
         duckdb_sql = CreatePerfettoViewSql(*create_view);
       } else if (const auto* include =
                      std::get_if<PerfettoSqlParser::Include>(&stmt)) {
+        if (include->key == "android.monitor_contention") {
+          // intervals.overlap includes this module, but sched thread-level
+          // parallelism only needs the interval overlap macros.
+          ++setup_result.statement_count;
+          continue;
+        }
         if (included_modules_.find(include->key) != included_modules_.end()) {
           ++setup_result.statement_count;
           continue;
@@ -1175,6 +1270,14 @@ base::StatusOr<DuckDbEngine::QueryResult> DuckDbEngine::Execute(
         RETURN_IF_ERROR(execute_source(
             SqlSource::FromModuleInclude(*module_sql, include->key)));
         included_modules_.insert(include->key);
+        ++setup_result.statement_count;
+        continue;
+      } else if (const auto* create_macro =
+                     std::get_if<PerfettoSqlParser::CreateMacro>(&stmt)) {
+        RETURN_IF_ERROR(ExecuteCreateMacro(*create_macro));
+        ++setup_result.statement_count;
+        continue;
+      } else if (std::get_if<PerfettoSqlParser::CreateFunction>(&stmt)) {
         ++setup_result.statement_count;
         continue;
       } else {
@@ -1191,6 +1294,7 @@ base::StatusOr<DuckDbEngine::QueryResult> DuckDbEngine::Execute(
       ASSIGN_OR_RETURN(final_result,
                        ExecuteReturningStatement(
                            ApplyDuckDbSqlRewrites(std::move(*duckdb_sql))));
+      RETURN_IF_ERROR(final_result->status);
     }
     return parser.status();
   };

@@ -26,10 +26,13 @@
 #include <vector>
 
 #include "perfetto/base/status.h"
+#include "perfetto/ext/base/flat_hash_map.h"
 #include "perfetto/ext/base/status_or.h"
 #include "perfetto/trace_processor/basic_types.h"
 #include "src/trace_processor/core/dataframe/specs.h"
 #include "src/trace_processor/perfetto_sql/engine/perfetto_sql_engine.h"
+#include "src/trace_processor/perfetto_sql/parser/perfetto_sql_parser.h"
+#include "src/trace_processor/perfetto_sql/preprocessor/perfetto_sql_preprocessor.h"
 
 struct sqlite3;
 struct sqlite3_stmt;
@@ -115,6 +118,8 @@ class DuckDbEngine {
   base::Status ExecForSetup(const std::string& sql);
   base::StatusOr<QueryResult> ExecuteReturningStatement(
       const std::string& sql);
+  base::Status ExecuteCreateMacro(
+      const PerfettoSqlParser::CreateMacro& create_macro);
 
   static void DataframeReplacementScan(duckdb_replacement_scan_info info,
                                        const char* table_name,
@@ -128,6 +133,7 @@ class DuckDbEngine {
   duckdb_connection conn_ = nullptr;
   std::unordered_map<std::string, RegisteredDataframe> dataframes_;
   std::unordered_set<std::string> included_modules_;
+  base::FlatHashMap<std::string, PerfettoSqlPreprocessor::Macro> macros_;
 };
 
 }  // namespace perfetto::trace_processor
