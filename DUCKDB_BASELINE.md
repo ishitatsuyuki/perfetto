@@ -6,20 +6,32 @@ The current `--experimental-duckdb` integration is aimed at making selected
 sched stdlib queries useful for benchmarking. Broad trace processor diff-test
 compatibility is intentionally not the primary goal for this phase.
 
-## Current Benchmark Target
+## Current Benchmark Targets
 
-The active target is sched query performance on `trace_file.perfetto-trace`.
+The active public target is sched query performance on
+`test/data/example_android_trace_30s.pb`. It has enough scheduler data to be a
+useful checked-in baseline: 384,623 `sched` rows, 549,904 `thread_state` rows,
+and 8 CPUs.
+
+For scale comparison, the table also keeps results from the longer local
+`trace_file.perfetto-trace` benchmark trace. That trace is not checked in, but
+it shows the larger-data behavior: 5,063,305 `sched` rows and 8,474,508
+`thread_state` rows, and 16 CPUs.
+
 Each benchmark uses one `INCLUDE PERFETTO MODULE ...` statement and one final
-`SELECT count(*)` per shell invocation.
+`SELECT count(*)` per shell invocation. The public-trace times are medians of
+three runs; the long-trace times are the prior private benchmark snapshot. All
+times exclude trace loading, matching the shell's reported
+`Query execution time`.
 
-| Query | SQLite | DuckDB | Count |
-| --- | ---: | ---: | ---: |
-| `sched_with_thread_process` | 922 ms | 182 ms | 5,063,305 |
-| `sched_time_in_state_for_thread` | 2,771 ms | 814 ms | 3,902 |
-| `sched_percentage_of_time_in_state` | 2,765 ms | 809 ms | 970 |
-| `sched_runnable_thread_count` | 23,179 ms | 2,237 ms | 5,241,893 |
-| `sched_uninterruptible_sleep_thread_count` | 23,117 ms | 2,270 ms | 1,838,199 |
-| `sched_active_cpu_count` | 22,846 ms | 2,217 ms | 5,053,410 |
+| Query | Public SQLite | Public DuckDB | Public Count | Long SQLite | Long DuckDB | Long Count |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `sched_with_thread_process` | 64 ms | 22 ms | 384,623 | 922 ms | 182 ms | 5,063,305 |
+| `sched_time_in_state_for_thread` | 151 ms | 58 ms | 5,962 | 2,771 ms | 814 ms | 3,902 |
+| `sched_percentage_of_time_in_state` | 151 ms | 58 ms | 1,617 | 2,765 ms | 809 ms | 970 |
+| `sched_runnable_thread_count` | 1,172 ms | 169 ms | 63,217 | 23,179 ms | 2,237 ms | 5,241,893 |
+| `sched_uninterruptible_sleep_thread_count` | 1,165 ms | 167 ms | 53,588 | 23,117 ms | 2,270 ms | 1,838,199 |
+| `sched_active_cpu_count` | 1,166 ms | 167 ms | 384,187 | 22,846 ms | 2,217 ms | 5,053,410 |
 
 Previously measured sched module probes:
 
@@ -32,7 +44,7 @@ Example command shape:
 
 ```sh
 out/codex_duckdb/trace_processor_shell query --experimental-duckdb \
-  -f /tmp/query.sql trace_file.perfetto-trace
+  -f /tmp/query.sql test/data/example_android_trace_30s.pb
 ```
 
 Example query:
