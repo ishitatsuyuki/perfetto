@@ -63,6 +63,10 @@ SELECT count(*) AS c FROM sched_runnable_thread_count;
   `trace_dur()` for modules that reference trace bounds while loading.
 - Non-final setup statement failures are returned immediately so failed CTAS
   statements are not hidden behind later missing-table errors.
+- `EXPLAIN ANALYZE <stmt>` bypasses the PerfettoSQL frontend in the DuckDB
+  path and is sent directly to DuckDB, which returns the per-operator profile
+  tree. `PRAGMA enable_profiling` also passes through as an alternative, but
+  its output file only keeps the last statement.
 - Non-delegating SQL-defined `CREATE PERFETTO FUNCTION` statements are
   translated into DuckDB scalar/table macros on a best-effort basis. Function
   bodies that reference unsupported intrinsics are still skipped until called.

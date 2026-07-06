@@ -84,6 +84,24 @@ std::string ApplyDuckDbSqlRewrites(std::string sql) {
   return sql;
 }
 
+bool StartsWithExplainAnalyze(std::string_view sql) {
+  static constexpr std::string_view kPrefix = "explain analyze";
+  size_t pos = 0;
+  while (pos < sql.size() && base::IsSpace(sql[pos])) {
+    ++pos;
+  }
+  if (sql.size() - pos < kPrefix.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < kPrefix.size(); ++i) {
+    if (base::Lowercase(sql[pos + i]) != kPrefix[i]) {
+      return false;
+    }
+  }
+  return sql.size() == pos + kPrefix.size() ||
+         base::IsSpace(sql[pos + kPrefix.size()]);
+}
+
 std::string CreatePerfettoTableSql(
     const PerfettoSqlParser::CreateTable& create_table) {
   std::string sql = "CREATE ";
@@ -1309,6 +1327,10 @@ base::StatusOr<DuckDbEngine::QueryResult> DuckDbEngine::Execute(
     const std::vector<SqlPackage>& sql_packages,
     const std::function<std::optional<std::string>(const std::string&)>&
         include_resolver) {
+  if (StartsWithExplainAnalyze(sql)) {
+    return ExecuteReturningStatement(ApplyDuckDbSqlRewrites(sql));
+  }
+
   QueryResult setup_result;
   std::optional<QueryResult> final_result;
 
