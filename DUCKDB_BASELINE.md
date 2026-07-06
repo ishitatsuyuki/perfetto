@@ -6,53 +6,74 @@ The current `--experimental-duckdb` integration is aimed at making selected
 sched stdlib queries useful for benchmarking. Broad trace processor diff-test
 compatibility is intentionally not the primary goal for this phase.
 
-## Current Benchmark Targets
+## Benchmark Targets
 
 The active public target is sched query performance on
 `test/data/example_android_trace_30s.pb`. It has enough scheduler data to be a
 useful checked-in baseline: 384,623 `sched` rows, 549,904 `thread_state` rows,
-and 8 CPUs.
-
-For scale comparison, the table also keeps results from the longer local
-`trace_file.perfetto-trace` benchmark trace. That trace is not checked in, but
-it shows the larger-data behavior: 5,063,305 `sched` rows and 8,474,508
+and 8 CPUs. For scale comparison we also run the longer local
+`trace_file.perfetto-trace` (not checked in): 5,063,305 `sched` rows, 8,474,508
 `thread_state` rows, and 16 CPUs.
 
-Each benchmark uses one `INCLUDE PERFETTO MODULE ...` statement and one final
-`SELECT count(*)` per shell invocation. The public-trace times are medians of
-three runs; the long-trace times are the prior private benchmark snapshot. All
-times exclude trace loading, matching the shell's reported
-`Query execution time`.
-
-| Query | Public SQLite | Public DuckDB | Public Count | Long SQLite | Long DuckDB | Long Count |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `sched_with_thread_process` | 64 ms | 22 ms | 384,623 | 922 ms | 182 ms | 5,063,305 |
-| `sched_time_in_state_for_thread` | 151 ms | 58 ms | 5,962 | 2,771 ms | 814 ms | 3,902 |
-| `sched_percentage_of_time_in_state` | 151 ms | 58 ms | 1,617 | 2,765 ms | 809 ms | 970 |
-| `sched_runnable_thread_count` | 1,172 ms | 169 ms | 63,217 | 23,179 ms | 2,237 ms | 5,241,893 |
-| `sched_uninterruptible_sleep_thread_count` | 1,165 ms | 167 ms | 53,588 | 23,117 ms | 2,270 ms | 1,838,199 |
-| `sched_active_cpu_count` | 1,166 ms | 167 ms | 384,187 | 22,846 ms | 2,217 ms | 5,053,410 |
-
-Previously measured sched module probes:
-
-| Query | SQLite | DuckDB | Count |
-| --- | ---: | ---: | ---: |
-| `sched_previous_runnable_on_thread` | 9,168 ms | 3,201 ms | 2,977,574 |
-| `sched_latency_for_running_interval` | 10,838 ms | 5,254 ms | 2,977,573 |
-
-Example command shape:
-
-```sh
-out/codex_duckdb/trace_processor_shell query --experimental-duckdb \
-  -f /tmp/query.sql test/data/example_android_trace_30s.pb
-```
-
-Example query:
+Benchmarks are grouped by stdlib module, because a single `INCLUDE` builds every
+table a module defines. `sched.thread_level_parallelism` builds all three of its
+tables (`runnable`, `uninterruptible_sleep`, `active_cpu`) on every include, and
+`sched.time_in_state` builds both of its tables, so timing them per-table would
+just measure the same module load 3x / 2x. Each group therefore does one
+`INCLUDE` and then materializes *every* output that module exposes:
 
 ```sql
 INCLUDE PERFETTO MODULE sched.thread_level_parallelism;
-SELECT count(*) AS c FROM sched_runnable_thread_count;
+CREATE PERFETTO TABLE r0 AS SELECT * FROM sched_runnable_thread_count;
+CREATE PERFETTO TABLE r1 AS SELECT * FROM sched_uninterruptible_sleep_thread_count;
+CREATE PERFETTO TABLE r2 AS SELECT * FROM sched_active_cpu_count;
 ```
+
+`CREATE PERFETTO TABLE` maps to a plain DuckDB `CREATE TABLE ... AS SELECT`, so
+every output row is genuinely computed and stored in a real temp result table
+(no `count(*)` shortcut that would let the optimizer skip building the rows).
+Timing uses the shell's `--perf-file` output (`t_load,t_query`); we report
+`t_query` in ms, excluding trace load. The three groups are three independent
+data points. Of the three, only `sched.with_context` is a `PERFETTO VIEW` (built
+lazily, so the join work happens at materialization time); the other two modules
+are backed by `PERFETTO TABLE`s built eagerly at `INCLUDE`, so their group time
+is dominated by the module load and the per-table `CREATE ... AS SELECT` is a
+cheap copy.
+
+Public trace (`test/data/example_android_trace_30s.pb`, median of 5, load ~0.4 s):
+
+| Module (materialize all outputs) | SQLite | DuckDB | Speedup | Total rows |
+| --- | ---: | ---: | ---: | ---: |
+| `sched.with_context` | 263 ms | 133 ms | 2.0x | 384,623 |
+| `sched.time_in_state` | 153 ms | 60 ms | 2.5x | 7,579 |
+| `sched.thread_level_parallelism` | 1,206 ms | 178 ms | 6.8x | 500,992 |
+
+Long trace (`trace_file.perfetto-trace`, 84 MB, median of 2, load ~4.8 s):
+
+| Module (materialize all outputs) | SQLite | DuckDB | Speedup | Total rows |
+| --- | ---: | ---: | ---: | ---: |
+| `sched.with_context` | 3,546 ms | 1,558 ms | 2.3x | 5,063,305 |
+| `sched.time_in_state` | 2,660 ms | 810 ms | 3.3x | 4,872 |
+| `sched.thread_level_parallelism` | 23,175 ms | 2,278 ms | 10.2x | 12,133,502 |
+
+Observations:
+
+- The DuckDB lead widens with scale. The window-function-heavy
+  `thread_level_parallelism` module goes from 6.8x on the public trace to 10.2x
+  on the long trace — its `intervals_overlap_count!` computation (12M output
+  rows) is where DuckDB's vectorized engine pulls furthest ahead of SQLite's
+  row-at-a-time execution.
+- `sched.with_context` is the honest low end: it is a lazy view, so forcing its
+  5M-row join to materialize is real per-row work for both engines and the lead
+  stays a modest ~2x.
+- `sched.time_in_state` has tiny outputs (a few thousand rows), so its group time
+  is essentially the module-load cost; DuckDB holds a steady ~2.5–3.3x.
+
+The benchmark harness is `bench_duckdb_materialize.sh` at the repo root; it
+builds the per-module SQL, runs each backend N times through
+`trace_processor_shell query [--experimental-duckdb] --perf-file`, and reports
+the median `t_query`. Invoke it as
+`bash bench_duckdb_materialize.sh [trace] [runs]`.
 
 ## Current DuckDB Compatibility Notes
 
