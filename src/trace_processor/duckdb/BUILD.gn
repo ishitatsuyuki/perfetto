@@ -30,7 +30,7 @@ source_set("duckdb") {
     "../core/dataframe",
     "../perfetto_sql/engine",
     "../perfetto_sql/parser",
-    "../perfetto_sql/preprocessor",
+    "../perfetto_sql/tokenizer",
     "../sqlite",
     "../util:stdlib",
   ]

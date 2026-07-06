@@ -63,12 +63,15 @@ SELECT count(*) AS c FROM sched_runnable_thread_count;
   `trace_dur()` for modules that reference trace bounds while loading.
 - Non-final setup statement failures are returned immediately so failed CTAS
   statements are not hidden behind later missing-table errors.
+- Non-delegating SQL-defined `CREATE PERFETTO FUNCTION` statements are
+  translated into DuckDB scalar/table macros on a best-effort basis. Function
+  bodies that reference unsupported intrinsics are still skipped until called.
 
 ## Active Gaps
 
-- `CREATE PERFETTO FUNCTION` is skipped in the DuckDB path. This is enough for
-  the current table/view benchmarks but not for queries that call those
-  functions.
+- Delegating `CREATE PERFETTO FUNCTION ... DELEGATES TO ...` aliases remain
+  skipped because the DuckDB path does not yet register the C++ intrinsic
+  targets they delegate to.
 - `CREATE VIRTUAL TABLE ... USING SPAN_JOIN` and other virtual table modules
   are not supported.
 - The compatibility rewrites are deliberately narrow and benchmark-driven.

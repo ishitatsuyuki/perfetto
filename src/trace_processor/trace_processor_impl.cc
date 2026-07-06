@@ -754,9 +754,23 @@ Iterator TraceProcessorImpl::ExecuteQuery(const std::string& sql) {
     }
     std::vector<SqlPackage> sql_packages(registered_sql_packages_.begin(),
                                          registered_sql_packages_.end());
+    auto include_resolver =
+        [this](const std::string& key) -> std::optional<std::string> {
+      const sql_modules::RegisteredPackage* package =
+          engine_->FindPackageForModule(key);
+      if (!package) {
+        return std::nullopt;
+      }
+      const std::string_view* module = package->modules.Find(key);
+      if (!module) {
+        return std::nullopt;
+      }
+      return std::string(*module);
+    };
     base::StatusOr<DuckDbEngine::QueryResult> result =
         import_status.ok()
-            ? duckdb_engine_->Execute(non_breaking_sql, sql_packages)
+            ? duckdb_engine_->Execute(non_breaking_sql, sql_packages,
+                                      include_resolver)
             : base::StatusOr<DuckDbEngine::QueryResult>(
                   std::move(import_status));
     return Iterator(std::make_unique<DuckDbIteratorImpl>(

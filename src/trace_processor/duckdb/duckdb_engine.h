@@ -19,6 +19,8 @@
 
 #include <duckdb.h>
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -30,9 +32,8 @@
 #include "perfetto/ext/base/status_or.h"
 #include "perfetto/trace_processor/basic_types.h"
 #include "src/trace_processor/core/dataframe/specs.h"
-#include "src/trace_processor/perfetto_sql/engine/perfetto_sql_engine.h"
+#include "src/trace_processor/perfetto_sql/engine/perfetto_sql_connection.h"
 #include "src/trace_processor/perfetto_sql/parser/perfetto_sql_parser.h"
-#include "src/trace_processor/perfetto_sql/preprocessor/perfetto_sql_preprocessor.h"
 
 struct sqlite3;
 struct sqlite3_stmt;
@@ -76,7 +77,7 @@ class DuckDbEngine {
     uint32_t statement_count_with_output = 0;
   };
 
-  using StaticTable = PerfettoSqlEngine::StaticTable;
+  using StaticTable = PerfettoSqlConnection::StaticTable;
 
   DuckDbEngine();
   ~DuckDbEngine();
@@ -95,7 +96,9 @@ class DuckDbEngine {
   base::Status InstallPrelude();
   base::StatusOr<QueryResult> Execute(
       const std::string& sql,
-      const std::vector<SqlPackage>& sql_packages);
+      const std::vector<SqlPackage>& sql_packages,
+      const std::function<std::optional<std::string>(const std::string&)>&
+          include_resolver);
   void Interrupt();
 
  private:
@@ -116,10 +119,11 @@ class DuckDbEngine {
       const std::string& name) const;
   base::Status RegisterDataframeTableFunction();
   base::Status ExecForSetup(const std::string& sql);
-  base::StatusOr<QueryResult> ExecuteReturningStatement(
-      const std::string& sql);
+  base::StatusOr<QueryResult> ExecuteReturningStatement(const std::string& sql);
   base::Status ExecuteCreateMacro(
       const PerfettoSqlParser::CreateMacro& create_macro);
+  base::Status ExecuteCreateFunction(
+      const PerfettoSqlParser::CreateFunction& create_function);
 
   static void DataframeReplacementScan(duckdb_replacement_scan_info info,
                                        const char* table_name,
@@ -133,7 +137,7 @@ class DuckDbEngine {
   duckdb_connection conn_ = nullptr;
   std::unordered_map<std::string, RegisteredDataframe> dataframes_;
   std::unordered_set<std::string> included_modules_;
-  base::FlatHashMap<std::string, PerfettoSqlPreprocessor::Macro> macros_;
+  base::FlatHashMap<std::string, PerfettoSqlParser::Macro> macros_;
 };
 
 }  // namespace perfetto::trace_processor

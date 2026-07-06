@@ -44,7 +44,7 @@
 #include "src/trace_processor/core/dataframe/dataframe.h"
 #include "src/trace_processor/core/dataframe/specs.h"
 #include "src/trace_processor/perfetto_sql/parser/perfetto_sql_parser.h"
-#include "src/trace_processor/perfetto_sql/preprocessor/perfetto_sql_preprocessor.h"
+#include "src/trace_processor/perfetto_sql/tokenizer/sqlite_tokenizer.h"
 #include "src/trace_processor/sqlite/sql_source.h"
 #include "src/trace_processor/util/sql_modules.h"
 
@@ -115,6 +115,60 @@ std::string CreatePerfettoViewSql(
   return sql;
 }
 
+SqlSource RewriteFunctionArgumentsForDuckDb(
+    const SqlSource& sql,
+    const FunctionPrototype& prototype) {
+  base::FlatHashMap<std::string, std::string> args;
+  for (const auto& arg : prototype.arguments) {
+    args.Insert(arg.dollar_name().ToStdString(), arg.name().ToStdString());
+  }
+
+  SqliteTokenizer tokenizer(sql);
+  SqlSource::Rewriter rewriter(sql);
+  for (SqliteTokenizer::Token token = tokenizer.Next(); !token.IsTerminal();
+       token = tokenizer.Next()) {
+    if (token.token_type != sql_token::kVariable) {
+      continue;
+    }
+    auto* arg = args.Find(std::string(token.str));
+    if (!arg) {
+      continue;
+    }
+    tokenizer.RewriteToken(
+        rewriter, token,
+        SqlSource::FromTraceProcessorImplementation(std::string(*arg)));
+  }
+  return std::move(rewriter).Build();
+}
+
+std::string CreatePerfettoFunctionSql(
+    const PerfettoSqlParser::CreateFunction& create_function) {
+  std::vector<std::string> args;
+  args.reserve(create_function.prototype.arguments.size());
+  for (const auto& arg : create_function.prototype.arguments) {
+    args.emplace_back(arg.name().ToStdString());
+  }
+
+  SqlSource body = RewriteFunctionArgumentsForDuckDb(create_function.sql,
+                                                     create_function.prototype);
+  std::string sql = "CREATE ";
+  if (create_function.replace) {
+    sql += "OR REPLACE ";
+  }
+  sql += "MACRO ";
+  sql += create_function.prototype.function_name;
+  sql += "(";
+  sql += base::Join(args, ", ");
+  sql += ") AS ";
+  if (create_function.returns.is_table) {
+    sql += "TABLE ";
+  }
+  sql += "(";
+  sql += body.sql();
+  sql += ")";
+  return sql;
+}
+
 const std::string* FindSqlModule(const std::vector<SqlPackage>& sql_packages,
                                  const std::string& include_key) {
   for (const SqlPackage& package : sql_packages) {
@@ -131,9 +185,15 @@ const std::string* FindSqlModule(const std::vector<SqlPackage>& sql_packages,
   return nullptr;
 }
 
-constexpr std::array<std::string_view, 6> kTokensAllowedInMacro{
-    "ColumnNameList", "_ProjectionFragment", "_TableNameList", "ColumnName",
-    "Expr",           "TableOrSubquery",
+constexpr std::array<std::string_view, 8> kTokensAllowedInMacro{
+    "ColumnNameList",
+    "_ProjectionFragment",
+    "_TableNameList",
+    "ColumnName",
+    "Expr",
+    "ExprList",
+    "TableOrSubquery",
+    "UnparenExprList",
 };
 
 bool IsTokenAllowedInMacro(const std::string& str) {
@@ -910,15 +970,15 @@ base::Status DuckDbEngine::RegisterDataframeTableFunction() {
   duckdb_state state = duckdb_register_table_function(conn_, function);
   duckdb_destroy_table_function(&function);
   if (state != DuckDBSuccess) {
-    return base::ErrStatus("DuckDB failed to register dataframe table function");
+    return base::ErrStatus(
+        "DuckDB failed to register dataframe table function");
   }
   return base::OkStatus();
 }
 
-void DuckDbEngine::DataframeReplacementScan(
-    duckdb_replacement_scan_info info,
-    const char* table_name,
-    void* data) {
+void DuckDbEngine::DataframeReplacementScan(duckdb_replacement_scan_info info,
+                                            const char* table_name,
+                                            void* data) {
   if (!table_name || !data) {
     return;
   }
@@ -962,10 +1022,9 @@ void DuckDbEngine::DataframeScanBind(duckdb_bind_info info) {
       engine->GetRegisteredDataframe(table_name);
   if (!registered) {
     duckdb_bind_set_error(
-        info,
-        base::StackString<256>("Perfetto dataframe table not found: %s",
-                               table_name.c_str())
-            .c_str());
+        info, base::StackString<256>("Perfetto dataframe table not found: %s",
+                                     table_name.c_str())
+                  .c_str());
     return;
   }
 
@@ -978,8 +1037,8 @@ void DuckDbEngine::DataframeScanBind(duckdb_bind_info info) {
   for (uint32_t i = 0; i < bind_data->spec.column_names.size(); ++i) {
     duckdb_logical_type type = duckdb_create_logical_type(
         DuckDbLogicalTypeForColumn(bind_data->spec.column_specs[i]));
-    duckdb_bind_add_result_column(
-        info, bind_data->spec.column_names[i].c_str(), type);
+    duckdb_bind_add_result_column(info, bind_data->spec.column_names[i].c_str(),
+                                  type);
     duckdb_destroy_logical_type(&type);
   }
   duckdb_bind_set_cardinality(
@@ -1207,7 +1266,7 @@ base::Status DuckDbEngine::ExecuteCreateMacro(
   for (const auto& arg : create_macro.args) {
     args.push_back(arg.first.sql());
   }
-  PerfettoSqlPreprocessor::Macro macro{
+  PerfettoSqlParser::Macro macro{
       create_macro.replace,
       create_macro.name.sql(),
       std::move(args),
@@ -1228,15 +1287,35 @@ base::Status DuckDbEngine::ExecuteCreateMacro(
   return base::OkStatus();
 }
 
+base::Status DuckDbEngine::ExecuteCreateFunction(
+    const PerfettoSqlParser::CreateFunction& create_function) {
+  if (create_function.target_function) {
+    PERFETTO_DLOG("DuckDB skipped delegated Perfetto function %s",
+                  create_function.prototype.function_name.c_str());
+    return base::OkStatus();
+  }
+  base::Status status = ExecForSetup(
+      ApplyDuckDbSqlRewrites(CreatePerfettoFunctionSql(create_function)));
+  if (!status.ok()) {
+    PERFETTO_DLOG("DuckDB skipped Perfetto function %s: %s",
+                  create_function.prototype.function_name.c_str(),
+                  status.c_message());
+  }
+  return base::OkStatus();
+}
+
 base::StatusOr<DuckDbEngine::QueryResult> DuckDbEngine::Execute(
     const std::string& sql,
-    const std::vector<SqlPackage>& sql_packages) {
+    const std::vector<SqlPackage>& sql_packages,
+    const std::function<std::optional<std::string>(const std::string&)>&
+        include_resolver) {
   QueryResult setup_result;
   std::optional<QueryResult> final_result;
 
   std::function<base::Status(SqlSource)> execute_source =
       [&](SqlSource source) -> base::Status {
-    PerfettoSqlParser parser(std::move(source), macros_);
+    PerfettoSqlParser parser(macros_);
+    parser.Reset(std::move(source));
     while (parser.Next()) {
       const PerfettoSqlParser::Statement& stmt = parser.statement();
       std::optional<std::string> duckdb_sql;
@@ -1261,8 +1340,9 @@ base::StatusOr<DuckDbEngine::QueryResult> DuckDbEngine::Execute(
           ++setup_result.statement_count;
           continue;
         }
+        std::optional<std::string> resolved = include_resolver(include->key);
         const std::string* module_sql =
-            FindSqlModule(sql_packages, include->key);
+            resolved ? &*resolved : FindSqlModule(sql_packages, include->key);
         if (!module_sql) {
           return base::ErrStatus("INCLUDE: unknown module '%s'",
                                  include->key.c_str());
@@ -1277,7 +1357,9 @@ base::StatusOr<DuckDbEngine::QueryResult> DuckDbEngine::Execute(
         RETURN_IF_ERROR(ExecuteCreateMacro(*create_macro));
         ++setup_result.statement_count;
         continue;
-      } else if (std::get_if<PerfettoSqlParser::CreateFunction>(&stmt)) {
+      } else if (const auto* create_function =
+                     std::get_if<PerfettoSqlParser::CreateFunction>(&stmt)) {
+        RETURN_IF_ERROR(ExecuteCreateFunction(*create_function));
         ++setup_result.statement_count;
         continue;
       } else {
