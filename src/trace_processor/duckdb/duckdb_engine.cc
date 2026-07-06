@@ -101,6 +101,44 @@ bool StartsWithExplainAnalyze(std::string_view sql) {
          base::IsSpace(sql[pos + kPrefix.size()]);
 }
 
+bool StartsWithSetStatement(std::string_view sql) {
+  static constexpr std::string_view kPrefix = "set";
+  size_t pos = 0;
+  while (pos < sql.size() && base::IsSpace(sql[pos])) {
+    ++pos;
+  }
+  if (sql.size() - pos < kPrefix.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < kPrefix.size(); ++i) {
+    if (base::Lowercase(sql[pos + i]) != kPrefix[i]) {
+      return false;
+    }
+  }
+  return sql.size() > pos + kPrefix.size() &&
+         base::IsSpace(sql[pos + kPrefix.size()]);
+}
+
+std::string_view TrimLeft(std::string_view sql) {
+  size_t pos = 0;
+  while (pos < sql.size() && base::IsSpace(sql[pos])) {
+    ++pos;
+  }
+  return sql.substr(pos);
+}
+
+std::optional<std::string> TakeLeadingStatement(std::string* sql) {
+  size_t semicolon = sql->find(';');
+  if (semicolon == std::string::npos) {
+    std::string statement = std::move(*sql);
+    sql->clear();
+    return statement;
+  }
+  std::string statement = sql->substr(0, semicolon + 1);
+  sql->erase(0, semicolon + 1);
+  return statement;
+}
+
 std::string CreatePerfettoTableSql(
     const PerfettoSqlParser::CreateTable& create_table) {
   std::string sql = "CREATE ";
@@ -1006,6 +1044,23 @@ base::StatusOr<DuckDbEngine::QueryResult> DuckDbEngine::Execute(
     return ExecuteReturningStatement(ApplyDuckDbSqlRewrites(sql));
   }
 
+  std::string remaining_sql = sql;
+  while (StartsWithSetStatement(remaining_sql)) {
+    std::optional<std::string> statement =
+        TakeLeadingStatement(&remaining_sql);
+    PERFETTO_CHECK(statement);
+    base::Status status = ExecForSetup(ApplyDuckDbSqlRewrites(*statement));
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  if (TrimLeft(remaining_sql).empty()) {
+    return ExecuteReturningStatement(ApplyDuckDbSqlRewrites(sql));
+  }
+  if (StartsWithExplainAnalyze(remaining_sql)) {
+    return ExecuteReturningStatement(ApplyDuckDbSqlRewrites(remaining_sql));
+  }
+
   QueryResult setup_result;
   std::optional<QueryResult> final_result;
 
@@ -1078,7 +1133,7 @@ base::StatusOr<DuckDbEngine::QueryResult> DuckDbEngine::Execute(
     return parser.status();
   };
 
-  RETURN_IF_ERROR(execute_source(SqlSource::FromExecuteQuery(sql)));
+  RETURN_IF_ERROR(execute_source(SqlSource::FromExecuteQuery(remaining_sql)));
   if (!final_result) {
     return base::ErrStatus("No valid SQL to run");
   }

@@ -37,10 +37,15 @@ build_sql() { # $1=module $2=tables_csv $3=outfile
   } > "$3"
 }
 
-run_one() { # $1=engine_flag $2=sqlfile ; prints "t_load,t_query" ns
-  local flag="$1" sqlf="$2" perf="$WORK/perf.txt"
+run_one() { # $1=engine_flag $2=sqlfile $3=thread_count_or_empty ; prints "t_load,t_query" ns
+  local flag="$1" sqlf="$2" threads="${3:-}" perf="$WORK/perf.txt" run_sql="$sqlf"
+  if [ -n "$threads" ]; then
+    run_sql="$WORK/threaded.sql"
+    { printf 'SET threads=%s;\n' "$threads"; cat "$sqlf"; } > "$run_sql"
+  fi
+  rm -f "$perf"
   # shellcheck disable=SC2086
-  "$SHELL_BIN" query $flag --perf-file "$perf" -f "$sqlf" "$TRACE" >/dev/null 2>&1
+  "$SHELL_BIN" query $flag --perf-file "$perf" -f "$run_sql" "$TRACE" >/dev/null 2>&1
   cat "$perf"
 }
 
@@ -55,8 +60,8 @@ total_rows() { # $1=module $2=tables_csv ; sum of output row counts (via DuckDB)
 }
 
 echo "Trace: $TRACE   (runs: $RUNS, median t_query)"
-printf "%-32s | %10s | %10s | %8s | %12s\n" "module (materialize all outputs)" "SQLite ms" "DuckDB ms" "speedup" "total rows"
-printf -- '-%.0s' {1..86}; echo
+printf "%-32s | %10s | %10s | %10s | %8s | %9s | %12s\n" "module (materialize all outputs)" "SQLite ms" "DuckDB ms" "DuckDB 1T" "speedup" "1T speedup" "total rows"
+printf -- '-%.0s' {1..111}; echo
 load_reported=""
 for spec in "${SPECS[@]}"; do
   label="${spec%%|*}"; rest="${spec#*|}"
@@ -65,13 +70,16 @@ for spec in "${SPECS[@]}"; do
   build_sql "$module" "$tables" "$sqlf"
   rows=$(total_rows "$module" "$tables")
 
-  sq=(); dk=(); loads=()
+  sq=(); dk=(); dk1=(); loads=()
   for _ in $(seq "$RUNS"); do r=$(run_one "" "$sqlf"); sq+=("${r#*,}"); loads+=("${r%,*}"); done
   for _ in $(seq "$RUNS"); do r=$(run_one "--experimental-duckdb" "$sqlf"); dk+=("${r#*,}"); done
+  for _ in $(seq "$RUNS"); do r=$(run_one "--experimental-duckdb" "$sqlf" 1); dk1+=("${r#*,}"); done
   sqm=$(printf '%s\n' "${sq[@]}" | median_ms)
   dkm=$(printf '%s\n' "${dk[@]}" | median_ms)
+  dk1m=$(printf '%s\n' "${dk1[@]}" | median_ms)
   spd=$(awk -v s="$sqm" -v d="$dkm" 'BEGIN{ if(d>0) printf "%.1fx", s/d; else print "-" }')
-  printf "%-32s | %10s | %10s | %8s | %12s\n" "$label" "$sqm" "$dkm" "$spd" "$rows"
+  spd1=$(awk -v s="$sqm" -v d="$dk1m" 'BEGIN{ if(d>0) printf "%.1fx", s/d; else print "-" }')
+  printf "%-32s | %10s | %10s | %10s | %8s | %9s | %12s\n" "$label" "$sqm" "$dkm" "$dk1m" "$spd" "$spd1" "$rows"
   [ -z "$load_reported" ] && load_reported=$(printf '%s\n' "${loads[@]}" | median_ms)
 done
 echo "(trace load, median: ${load_reported} ms, excluded from query times above)"

@@ -159,6 +159,11 @@ class PerfettoSqlConnection {
   base::StatusOr<SqliteConnection::PreparedStatement> PrepareSqliteStatement(
       SqlSource sql);
 
+  // Executes a single plain SQLite statement without PerfettoSQL parsing.
+  // The returned statement has already been stepped once, matching
+  // ExecuteUntilLastStatement's iterator contract.
+  base::StatusOr<ExecutionResult> ExecuteRawSqliteStatement(SqlSource sql);
+
   // Registers a virtual table module with the given name.
   //
   // |name|: name of the module in SQL.

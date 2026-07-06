@@ -487,6 +487,22 @@ PerfettoSqlConnection::PrepareSqliteStatement(SqlSource sql_source) {
   return std::move(stmt);
 }
 
+base::StatusOr<PerfettoSqlConnection::ExecutionResult>
+PerfettoSqlConnection::ExecuteRawSqliteStatement(SqlSource sql) {
+  SqliteConnection::PreparedStatement stmt =
+      connection_->PrepareStatement(std::move(sql));
+  RETURN_IF_ERROR(stmt.status());
+  stmt.Step();
+  RETURN_IF_ERROR(stmt.status());
+
+  ExecutionStats stats;
+  stats.statement_count = 1;
+  stats.column_count =
+      static_cast<uint32_t>(sqlite3_column_count(stmt.sqlite_stmt()));
+  stats.statement_count_with_output = stats.column_count > 0;
+  return ExecutionResult{std::move(stmt), stats};
+}
+
 void PerfettoSqlConnection::Initialize(Initializer init) {
   // Wrap the ~100 static-table CREATEs in one transaction; otherwise SQLite
   // implicitly commits after each statement.

@@ -189,6 +189,24 @@
 namespace perfetto::trace_processor {
 namespace {
 
+bool StartsWithSqliteExplain(std::string_view sql) {
+  static constexpr std::string_view kPrefix = "explain";
+  size_t pos = 0;
+  while (pos < sql.size() && base::IsSpace(sql[pos])) {
+    ++pos;
+  }
+  if (sql.size() - pos < kPrefix.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < kPrefix.size(); ++i) {
+    if (base::Lowercase(sql[pos + i]) != kPrefix[i]) {
+      return false;
+    }
+  }
+  return sql.size() == pos + kPrefix.size() ||
+         base::IsSpace(sql[pos + kPrefix.size()]);
+}
+
 base::Status RegisterAllProtoBuilderFunctions(
     const DescriptorPool* pool,
     std::unordered_map<std::string, std::string>* proto_fn_name_to_path,
@@ -773,6 +791,13 @@ Iterator TraceProcessorImpl::ExecuteQuery(const std::string& sql) {
         this, std::move(result), sql_stats_row));
   }
 #endif
+  if (StartsWithSqliteExplain(non_breaking_sql)) {
+    base::StatusOr<PerfettoSqlConnection::ExecutionResult> result =
+        engine_->ExecuteRawSqliteStatement(
+            SqlSource::FromTraceProcessorImplementation(non_breaking_sql));
+    return Iterator(std::make_unique<SqliteIteratorImpl>(
+        this, std::move(result), sql_stats_row));
+  }
   base::StatusOr<PerfettoSqlConnection::ExecutionResult> result =
       engine_->ExecuteUntilLastStatement(
           SqlSource::FromExecuteQuery(std::move(non_breaking_sql)));
