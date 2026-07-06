@@ -24,7 +24,6 @@ source_set("duckdb") {
   deps = [
     "../../../gn:default_deps",
     "../../../gn:duckdb",
-    "../../../gn:sqlite",
     "../../../include/perfetto/trace_processor:basic_types",
     "../containers",
     "../core/dataframe",

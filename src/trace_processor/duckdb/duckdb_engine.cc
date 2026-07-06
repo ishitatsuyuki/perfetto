@@ -17,7 +17,6 @@
 #include "src/trace_processor/duckdb/duckdb_engine.h"
 
 #include <duckdb.h>
-#include <sqlite3.h>
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -232,32 +231,6 @@ std::string GetTokenNamesAllowedInMacro() {
   return base::Join(result, ", ");
 }
 
-const char* DuckDbTypeForColumn(
-    const core::dataframe::ColumnSpec& column_spec) {
-  using StorageType = core::dataframe::StorageType;
-  using Id = core::dataframe::Id;
-  using Uint32 = core::dataframe::Uint32;
-  using Int32 = core::dataframe::Int32;
-  using Int64 = core::dataframe::Int64;
-  using Double = core::dataframe::Double;
-  using String = core::dataframe::String;
-
-  const auto& type = column_spec.type;
-  switch (type.index()) {
-    case StorageType::GetTypeIndex<Id>():
-    case StorageType::GetTypeIndex<Uint32>():
-    case StorageType::GetTypeIndex<Int32>():
-    case StorageType::GetTypeIndex<Int64>():
-      return "BIGINT";
-    case StorageType::GetTypeIndex<Double>():
-      return "DOUBLE";
-    case StorageType::GetTypeIndex<String>():
-      return "VARCHAR";
-    default:
-      PERFETTO_FATAL("Unsupported dataframe storage type for DuckDB");
-  }
-}
-
 duckdb_type DuckDbLogicalTypeForColumn(
     const core::dataframe::ColumnSpec& column_spec) {
   using StorageType = core::dataframe::StorageType;
@@ -284,39 +257,6 @@ duckdb_type DuckDbLogicalTypeForColumn(
   }
 }
 
-const char* DuckDbTypeForSqliteColumn(const char* decl_type) {
-  if (!decl_type) {
-    return "VARCHAR";
-  }
-  std::string type = base::ToUpper(std::string(decl_type));
-  if (type.find("INT") != std::string::npos ||
-      type.find("BOOL") != std::string::npos) {
-    return "BIGINT";
-  }
-  if (type.find("DOUBLE") != std::string::npos ||
-      type.find("FLOAT") != std::string::npos ||
-      type.find("REAL") != std::string::npos) {
-    return "DOUBLE";
-  }
-  if (type.find("BLOB") != std::string::npos ||
-      type.find("BYTES") != std::string::npos) {
-    return "BLOB";
-  }
-  return "VARCHAR";
-}
-
-base::Status DuckDbAppendStateToStatus(duckdb_state state,
-                                       duckdb_appender appender,
-                                       const char* table_name,
-                                       const char* prefix) {
-  if (state == DuckDBSuccess) {
-    return base::OkStatus();
-  }
-  const char* err = duckdb_appender_error(appender);
-  return base::ErrStatus("%s for table %s: %s", prefix, table_name,
-                         err ? err : "unknown DuckDB error");
-}
-
 base::Status DuckDbStateToStatus(duckdb_state state,
                                  duckdb_result* result,
                                  const char* prefix) {
@@ -326,31 +266,6 @@ base::Status DuckDbStateToStatus(duckdb_state state,
   const char* err = result ? duckdb_result_error(result) : nullptr;
   return base::ErrStatus("%s: %s", prefix, err ? err : "unknown DuckDB error");
 }
-
-struct AppenderCellCallback : core::dataframe::CellCallback {
-  explicit AppenderCellCallback(duckdb_appender _appender)
-      : appender(_appender) {}
-
-  void OnCell(int64_t v) { Set(duckdb_append_int64(appender, v)); }
-  void OnCell(double v) { Set(duckdb_append_double(appender, v)); }
-  void OnCell(NullTermStringView v) {
-    Set(duckdb_append_varchar_length(appender, v.data(), v.size()));
-  }
-  void OnCell(std::nullptr_t) { Set(duckdb_append_null(appender)); }
-  void OnCell(uint32_t v) { Set(duckdb_append_int64(appender, v)); }
-  void OnCell(int32_t v) { Set(duckdb_append_int64(appender, v)); }
-
-  void Set(duckdb_state state) {
-    if (status.ok() && state != DuckDBSuccess) {
-      const char* err = duckdb_appender_error(appender);
-      status = base::ErrStatus("DuckDB append failed: %s",
-                               err ? err : "unknown DuckDB error");
-    }
-  }
-
-  duckdb_appender appender;
-  base::Status status = base::OkStatus();
-};
 
 struct DataframeScanBindData {
   DuckDbEngine* engine = nullptr;
@@ -604,142 +519,8 @@ base::Status DuckDbEngine::ExecForSetup(const std::string& sql) {
   return status;
 }
 
-base::Status DuckDbEngine::ImportStaticTables(
-    const std::vector<StaticTable>& tables,
+base::Status DuckDbEngine::SetTraceBounds(
     std::pair<int64_t, int64_t> trace_bounds) {
-  for (const StaticTable& table : tables) {
-    RETURN_IF_ERROR(CreateTableFromDataframe(table));
-    RETURN_IF_ERROR(AppendRowsFromDataframe(table));
-  }
-  RETURN_IF_ERROR(
-      ExecForSetup("CREATE OR REPLACE TABLE trace_bounds("
-                   "start_ts BIGINT, end_ts BIGINT)"));
-  return ExecForSetup(
-      base::StackString<256>("INSERT INTO trace_bounds VALUES(%" PRId64
-                             ", %" PRId64 ")",
-                             trace_bounds.first, trace_bounds.second)
-          .ToStdString());
-}
-
-base::Status DuckDbEngine::CreateTableFromDataframe(const StaticTable& table) {
-  auto spec = table.dataframe->CreateSpec();
-  std::vector<std::string> cols;
-  cols.reserve(spec.column_names.size());
-  for (uint32_t i = 0; i < spec.column_names.size(); ++i) {
-    cols.push_back(QuoteIdent(spec.column_names[i]) + " " +
-                   DuckDbTypeForColumn(spec.column_specs[i]));
-  }
-  std::string sql = "CREATE OR REPLACE TABLE " + QuoteIdent(table.name) + "(" +
-                    base::Join(cols, ", ") + ")";
-  return ExecForSetup(sql);
-}
-
-base::Status DuckDbEngine::AppendRowsFromDataframe(const StaticTable& table) {
-  duckdb_appender appender = nullptr;
-  if (duckdb_appender_create(conn_, nullptr, table.name.c_str(), &appender) !=
-      DuckDBSuccess) {
-    return base::ErrStatus("DuckDB appender creation failed for table %s",
-                           table.name.c_str());
-  }
-
-  for (uint32_t row = 0; row < table.dataframe->row_count(); ++row) {
-    for (uint32_t col = 0; col < table.dataframe->column_count(); ++col) {
-      AppenderCellCallback callback(appender);
-      table.dataframe->GetCell(row, col, callback);
-      if (!callback.status.ok()) {
-        duckdb_appender_destroy(&appender);
-        return callback.status;
-      }
-    }
-    if (duckdb_appender_end_row(appender) != DuckDBSuccess) {
-      const char* err = duckdb_appender_error(appender);
-      base::Status status = base::ErrStatus(
-          "DuckDB failed to finish row for table %s: %s", table.name.c_str(),
-          err ? err : "unknown DuckDB error");
-      duckdb_appender_destroy(&appender);
-      return status;
-    }
-  }
-
-  if (duckdb_appender_close(appender) != DuckDBSuccess) {
-    const char* err = duckdb_appender_error(appender);
-    base::Status status =
-        base::ErrStatus("DuckDB failed to close appender for table %s: %s",
-                        table.name.c_str(), err ? err : "unknown DuckDB error");
-    duckdb_appender_destroy(&appender);
-    return status;
-  }
-  duckdb_appender_destroy(&appender);
-  return base::OkStatus();
-}
-
-base::Status DuckDbEngine::ImportSqliteObjects(
-    sqlite3* db,
-    std::pair<int64_t, int64_t> trace_bounds) {
-  std::vector<std::string> table_names;
-  sqlite3_stmt* stmt = nullptr;
-  const char* sql = R"(
-    SELECT name
-    FROM sqlite_master
-    WHERE type IN ('table', 'view')
-      AND name NOT LIKE 'sqlite_%'
-    ORDER BY type, name
-  )";
-  int ret = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
-  if (ret != SQLITE_OK) {
-    return base::ErrStatus("DuckDB import failed to read SQLite catalog: %s",
-                           sqlite3_errmsg(db));
-  }
-  for (;;) {
-    ret = sqlite3_step(stmt);
-    if (ret == SQLITE_DONE) {
-      break;
-    }
-    if (ret != SQLITE_ROW) {
-      base::Status status = base::ErrStatus(
-          "DuckDB import failed while reading SQLite catalog: %s",
-          sqlite3_errmsg(db));
-      sqlite3_finalize(stmt);
-      return status;
-    }
-    const char* name =
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-    if (name && *name) {
-      table_names.emplace_back(name);
-    }
-  }
-  sqlite3_finalize(stmt);
-
-  table_names.push_back("stats");
-  table_names.push_back("sqlstats");
-  return ImportSqliteTables(db, table_names, trace_bounds);
-}
-
-base::Status DuckDbEngine::ImportSqliteTables(
-    sqlite3* db,
-    const std::vector<std::string>& table_names,
-    std::pair<int64_t, int64_t> trace_bounds) {
-  for (const std::string& table_name : table_names) {
-    std::string sql = "SELECT * FROM " + QuoteIdent(table_name);
-    sqlite3_stmt* stmt = nullptr;
-    int ret = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
-    if (ret != SQLITE_OK) {
-      PERFETTO_DLOG("DuckDB import skipped SQLite table %s: %s",
-                    table_name.c_str(), sqlite3_errmsg(db));
-      continue;
-    }
-
-    base::Status status = CreateTableFromSqliteStatement(table_name, stmt);
-    if (status.ok()) {
-      status = AppendRowsFromSqliteStatement(table_name, stmt);
-    }
-    sqlite3_finalize(stmt);
-    if (!status.ok()) {
-      PERFETTO_DLOG("DuckDB import skipped SQLite table %s: %s",
-                    table_name.c_str(), status.c_message());
-      continue;
-    }
-  }
   RETURN_IF_ERROR(
       ExecForSetup("CREATE OR REPLACE TABLE trace_bounds("
                    "start_ts BIGINT, end_ts BIGINT)"));
@@ -751,7 +532,8 @@ base::Status DuckDbEngine::ImportSqliteTables(
 }
 
 base::Status DuckDbEngine::RegisterDataframes(
-    const std::vector<StaticTable>& tables) {
+    const std::vector<StaticTable>& tables,
+    std::pair<int64_t, int64_t> trace_bounds) {
   dataframes_.clear();
   for (const StaticTable& table : tables) {
     RETURN_IF_ERROR(RegisterDataframe(table.name, table.dataframe));
@@ -761,7 +543,7 @@ base::Status DuckDbEngine::RegisterDataframes(
           table.name.substr(kIntrinsicPrefix.size()), table.dataframe));
     }
   }
-  return base::OkStatus();
+  return SetTraceBounds(trace_bounds);
 }
 
 base::Status DuckDbEngine::InstallPrelude() {
@@ -1132,113 +914,6 @@ void DuckDbEngine::DataframeScanFunction(duckdb_function_info info,
     ++row;
   }
   duckdb_data_chunk_set_size(output, row);
-}
-
-base::Status DuckDbEngine::CreateTableFromSqliteStatement(
-    const std::string& table_name,
-    sqlite3_stmt* stmt) {
-  int column_count = sqlite3_column_count(stmt);
-  if (column_count == 0) {
-    return base::ErrStatus("DuckDB import found no columns for table %s",
-                           table_name.c_str());
-  }
-
-  std::vector<std::string> cols;
-  cols.reserve(static_cast<size_t>(column_count));
-  for (int i = 0; i < column_count; ++i) {
-    const char* name = sqlite3_column_name(stmt, i);
-    std::string column_name =
-        name && *name ? std::string(name)
-                      : base::StackString<32>("col_%d", i).ToStdString();
-    cols.push_back(QuoteIdent(column_name) + " " +
-                   DuckDbTypeForSqliteColumn(sqlite3_column_decltype(stmt, i)));
-  }
-  std::string sql = "CREATE OR REPLACE TABLE " + QuoteIdent(table_name) + "(" +
-                    base::Join(cols, ", ") + ")";
-  return ExecForSetup(sql);
-}
-
-base::Status DuckDbEngine::AppendRowsFromSqliteStatement(
-    const std::string& table_name,
-    sqlite3_stmt* stmt) {
-  duckdb_appender appender = nullptr;
-  if (duckdb_appender_create(conn_, nullptr, table_name.c_str(), &appender) !=
-      DuckDBSuccess) {
-    return base::ErrStatus("DuckDB appender creation failed for table %s",
-                           table_name.c_str());
-  }
-
-  for (;;) {
-    int ret = sqlite3_step(stmt);
-    if (ret == SQLITE_DONE) {
-      break;
-    }
-    if (ret != SQLITE_ROW) {
-      base::Status status = base::ErrStatus(
-          "DuckDB import failed while reading SQLite table %s: %s",
-          table_name.c_str(), sqlite3_errmsg(sqlite3_db_handle(stmt)));
-      duckdb_appender_destroy(&appender);
-      return status;
-    }
-
-    int column_count = sqlite3_column_count(stmt);
-    for (int col = 0; col < column_count; ++col) {
-      base::Status status = base::OkStatus();
-      switch (sqlite3_column_type(stmt, col)) {
-        case SQLITE_INTEGER:
-          status = DuckDbAppendStateToStatus(
-              duckdb_append_int64(appender, sqlite3_column_int64(stmt, col)),
-              appender, table_name.c_str(), "DuckDB append failed");
-          break;
-        case SQLITE_FLOAT:
-          status = DuckDbAppendStateToStatus(
-              duckdb_append_double(appender, sqlite3_column_double(stmt, col)),
-              appender, table_name.c_str(), "DuckDB append failed");
-          break;
-        case SQLITE_TEXT: {
-          const char* value =
-              reinterpret_cast<const char*>(sqlite3_column_text(stmt, col));
-          int bytes = sqlite3_column_bytes(stmt, col);
-          status = DuckDbAppendStateToStatus(
-              duckdb_append_varchar_length(appender, value,
-                                           static_cast<idx_t>(bytes)),
-              appender, table_name.c_str(), "DuckDB append failed");
-          break;
-        }
-        case SQLITE_BLOB: {
-          const void* value = sqlite3_column_blob(stmt, col);
-          int bytes = sqlite3_column_bytes(stmt, col);
-          status = DuckDbAppendStateToStatus(
-              duckdb_append_blob(appender, value, static_cast<idx_t>(bytes)),
-              appender, table_name.c_str(), "DuckDB append failed");
-          break;
-        }
-        case SQLITE_NULL:
-          status = DuckDbAppendStateToStatus(duckdb_append_null(appender),
-                                             appender, table_name.c_str(),
-                                             "DuckDB append failed");
-          break;
-      }
-      if (!status.ok()) {
-        duckdb_appender_destroy(&appender);
-        return status;
-      }
-    }
-
-    base::Status status = DuckDbAppendStateToStatus(
-        duckdb_appender_end_row(appender), appender, table_name.c_str(),
-        "DuckDB failed to finish row");
-    if (!status.ok()) {
-      duckdb_appender_destroy(&appender);
-      return status;
-    }
-  }
-
-  base::Status status = DuckDbAppendStateToStatus(
-      duckdb_appender_close(appender), appender, table_name.c_str(),
-      "DuckDB failed to close appender");
-  duckdb_appender_destroy(&appender);
-  return status;
 }
 
 base::StatusOr<DuckDbEngine::QueryResult>

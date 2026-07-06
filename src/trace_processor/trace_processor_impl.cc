@@ -743,12 +743,8 @@ Iterator TraceProcessorImpl::ExecuteQuery(const std::string& sql) {
       tables.push_back({df.dataframe, df.name});
     }
 
-    base::Status import_status = duckdb_engine_->RegisterDataframes(tables);
-    if (import_status.ok()) {
-      import_status = duckdb_engine_->ImportSqliteTables(
-          engine_->sqlite_connection()->db(), {"stats", "sqlstats"},
-          cached_trace_bounds_);
-    }
+    base::Status import_status =
+        duckdb_engine_->RegisterDataframes(tables, cached_trace_bounds_);
     if (import_status.ok()) {
       import_status = duckdb_engine_->InstallPrelude();
     }

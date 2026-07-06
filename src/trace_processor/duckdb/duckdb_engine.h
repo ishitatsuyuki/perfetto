@@ -35,9 +35,6 @@
 #include "src/trace_processor/perfetto_sql/engine/perfetto_sql_connection.h"
 #include "src/trace_processor/perfetto_sql/parser/perfetto_sql_parser.h"
 
-struct sqlite3;
-struct sqlite3_stmt;
-
 namespace perfetto::trace_processor {
 
 class DuckDbEngine {
@@ -85,14 +82,8 @@ class DuckDbEngine {
   DuckDbEngine(DuckDbEngine&&) noexcept = delete;
   DuckDbEngine& operator=(DuckDbEngine&&) = delete;
 
-  base::Status ImportStaticTables(const std::vector<StaticTable>& tables,
+  base::Status RegisterDataframes(const std::vector<StaticTable>& tables,
                                   std::pair<int64_t, int64_t> trace_bounds);
-  base::Status ImportSqliteObjects(sqlite3* db,
-                                   std::pair<int64_t, int64_t> trace_bounds);
-  base::Status ImportSqliteTables(sqlite3* db,
-                                  const std::vector<std::string>& table_names,
-                                  std::pair<int64_t, int64_t> trace_bounds);
-  base::Status RegisterDataframes(const std::vector<StaticTable>& tables);
   base::Status InstallPrelude();
   base::StatusOr<QueryResult> Execute(
       const std::string& sql,
@@ -107,12 +98,7 @@ class DuckDbEngine {
     dataframe::DataframeSpec spec;
   };
 
-  base::Status CreateTableFromDataframe(const StaticTable& table);
-  base::Status AppendRowsFromDataframe(const StaticTable& table);
-  base::Status CreateTableFromSqliteStatement(const std::string& table_name,
-                                              sqlite3_stmt* stmt);
-  base::Status AppendRowsFromSqliteStatement(const std::string& table_name,
-                                             sqlite3_stmt* stmt);
+  base::Status SetTraceBounds(std::pair<int64_t, int64_t> trace_bounds);
   base::Status RegisterDataframe(const std::string& name,
                                  dataframe::Dataframe* dataframe);
   const RegisteredDataframe* GetRegisteredDataframe(
